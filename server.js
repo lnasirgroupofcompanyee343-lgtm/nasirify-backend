@@ -1,0 +1,505 @@
+const express = require('express');
+const cors = require('cors');
+const dns = require('dns');
+const axios = require('axios');
+const admin = require('firebase-admin');
+const helmet = require('helmet'); // Security headers
+const rateLimit = require('express-rate-limit'); // Rate limiting
+const cloudinary = require('cloudinary').v2; // Yeh add karein
+require('dotenv').config();
+
+
+// Yeh bhi top par hi add kar dein
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Firebase initialization
+if (!admin.apps.length) {
+  try {
+    if (process.env.FIREBASE_PROJECT_ID) {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: process.env.FIREBASE_PROJECT_ID,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined
+        })
+      });
+      console.log("✅ Firebase initialized with environment variables.");
+    } else {
+      admin.initializeApp({
+        credential: admin.credential.applicationDefault()
+      });
+      console.log("✅ Firebase initialized with default credentials.");
+    }
+  } catch (error) {
+    console.error("❌ Firebase Initialization Error:", error);
+  }
+}
+
+const db = admin.apps.length ? admin.firestore() : null;
+
+dns.setDefaultResultOrder('ipv4first');
+
+const app = express();
+
+// 🛡️ [SECURITY MIDDLEWARES]
+app.use(helmet()); // Basic security headers
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { success: false, message: "Too many requests, please try again later." }
+});
+app.use(limiter);
+
+app.use(cors({
+  origin: true, 
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-app-secret'], 
+  credentials: true
+}));
+
+app.use(express.json());
+
+app.use((req, res, next) => {
+  const secretKey = req.headers['x-app-secret'];
+  
+  if (!secretKey || secretKey !== process.env.MY_SECRET_APP_KEY) {
+    console.warn(`❌ Unauthorized access attempt!`);
+    return res.status(401).json({ success: false, message: "Unauthorized access!" });
+  }
+  next(); 
+});
+
+// Temporary OTP Storage
+const otpStore = {};
+
+// 🔔 [NEW] Expo Push Notification Helper Function
+async function sendPushNotification(pushToken, title, body, dataPayload = {}) {
+  if (!pushToken || !pushToken.startsWith('ExponentPushToken')) {
+    console.log("⚠️ Push Token is invalid or not found. Skipping push notification.");
+    return;
+  }
+
+  const message = {
+    to: pushToken,
+    sound: 'default',
+    title: title,
+    body: body,
+    data: dataPayload,
+  };
+
+  try {
+    const response = await axios.post('https://exp.host/--/api/v2/push/send', message, {
+      headers: {
+        'Accept': 'application/json',
+        'Accept-encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      }
+    });
+    console.log("🚀 [PUSH] Expo push notification sent successfully:", response.data);
+  } catch (error) {
+    console.error("❌ [PUSH] Failed to send Expo push notification:", error.message);
+  }
+}
+
+// 🔴 Admin Security Alert Function
+async function sendAdminAlert(subject, details) {
+  const adminEmailData = {
+    service_id: process.env.EMAILJS_SERVICE_ID,
+    template_id: process.env.EMAILJS_TEMPLATE_ID, 
+    user_id: process.env.EMAILJS_PUBLIC_KEY, 
+    template_params: {
+      email: process.env.ADMIN_EMAIL || "admin@yourdomain.com",
+      user_name: "Nasirify Security System",
+      passcode: "SECURITY ALERT",
+      time: new Date().toLocaleString(),
+      message_details: `${subject}: ${details}` 
+    }
+  };
+
+  try {
+    await axios.post('https://api.emailjs.com/api/v1.0/email/send', adminEmailData, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    console.log("🚨 [SECURITY] Admin Alert email sent successfully.");
+  } catch (err) {
+    console.error("❌ Failed to send security alert to admin:", err.message);
+  }
+}
+
+// 1️⃣ OTP Generate & Send API (Updated with 4 OTPs per Device/Day Limit)
+app.post('/api/send-otp', async (req, res) => {
+  const { email, name, deviceId } = req.body; 
+  if (!email) return res.status(400).json({ error: "ای میل درج کرنا ضروری ہے" });
+
+  const currentDevice = deviceId || "unknown_device";
+  const normalizedEmail = email.toLowerCase().trim();
+
+  // 🔄 Device Rate Limiting (Max 4 OTPs per 24 hours)
+  if (db && currentDevice !== "unknown_device") {
+    try {
+      const deviceOtpRef = db.collection("device_otp_limits").doc(currentDevice);
+      const deviceOtpSnap = await deviceOtpRef.get();
+      const now = Date.now();
+      const oneDayInMs = 24 * 60 * 60 * 1000;
+
+      if (deviceOtpSnap.exists) {
+        const data = deviceOtpSnap.data();
+        
+        if (now - data.firstAttemptAt > oneDayInMs) {
+          await deviceOtpRef.set({
+            count: 1,
+            firstAttemptAt: now,
+            lastAttemptAt: now
+          });
+        } else {
+          if (data.count >= 4) {
+            const timeLeft = Math.ceil((data.firstAttemptAt + oneDayInMs - now) / (60 * 60 * 1000));
+            return res.status(429).json({ 
+              success: false, 
+              message: `سیکیورٹی الرٹ: آپ اس ڈیوائس پر 24 گھنٹوں میں صرف 4 بار او ٹی پی منگوا سکتے ہیں۔ براہ کرم ${timeLeft} گھنٹے بعد کوشش کریں۔` 
+            });
+          }
+          
+          await deviceOtpRef.update({
+            count: data.count + 1,
+            lastAttemptAt: now
+          });
+        }
+      } else {
+        await deviceOtpRef.set({
+          count: 1,
+          firstAttemptAt: now,
+          lastAttemptAt: now
+        });
+      }
+    } catch (dbError) {
+      console.error("❌ Device OTP Limit DB Error:", dbError.message);
+    }
+  }
+
+  const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+  
+  otpStore[normalizedEmail] = {
+    otp: otpCode,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+    attempts: 0,
+    deviceId: currentDevice
+  };
+
+  setTimeout(() => {
+    if (otpStore[normalizedEmail] && otpStore[normalizedEmail].otp === otpCode) {
+      delete otpStore[normalizedEmail];
+      console.log(`🧹 [CLEANUP] Expired OTP memory cleared for ${normalizedEmail}`);
+    }
+  }, 5 * 60 * 1000);
+
+  console.log(`\n---------------------------------`);
+  console.log(`🔐 OTP for ${normalizedEmail} is: [ ${otpCode} ]`);
+  console.log(`📱 Device ID: ${currentDevice}`);
+  console.log(`---------------------------------\n`);
+
+  const emailJsData = {
+    service_id: process.env.EMAILJS_SERVICE_ID,
+    template_id: process.env.EMAILJS_TEMPLATE_ID,
+    user_id: process.env.EMAILJS_PUBLIC_KEY, 
+    template_params: {
+      email: normalizedEmail,          
+      passcode: otpCode,             
+      user_name: name || 'Nasirify User',
+      time: "5 Minutes"              
+    }
+  };
+
+  try {
+    const response = await axios.post('https://api.emailjs.com/api/v1.0/email/send', emailJsData, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+    if (response.status === 200) {
+      console.log(`🚀 OTP sent successfully via EmailJS to ${normalizedEmail}`);
+      return res.status(200).json({ 
+        success: true, 
+        message: "OTP کامیابی سے بھیج دیا گیا ہے!" 
+      });
+    } else {
+      throw new Error(`EmailJS status: ${response.status}`);
+    }
+
+  } catch (error) {
+    delete otpStore[normalizedEmail];
+    
+    console.error("❌ EmailJS Error Details:", error.response ? error.response.data : error.message);
+    
+    if (process.env.NODE_ENV === 'development') {
+      console.log("⚠️ Dev Mode: Continuing test via server logs...");
+      return res.status(200).json({ success: true, message: "OTP generated (Check server logs)!" });
+    }
+    
+    return res.status(500).json({ 
+      success: false, 
+      message: "ای میل سروس میں خرابی ہے۔ براہ کرم کچھ سیکنڈز بعد دوبارہ کوشش کریں۔" 
+    });
+  }
+});
+
+// 2️⃣ OTP Verification API (Database Integrated)
+app.post('/api/verify-otp', async (req, res) => {
+  const { email, otpEnteredByUser, deviceId } = req.body;
+  
+  if (!email || !otpEnteredByUser) {
+    return res.status(400).json({ success: false, message: "ای میل اور او ٹی پی دونوں ضروری ہیں" });
+  }
+
+  const userEmail = email.toLowerCase().trim();
+  const currentDevice = deviceId || "unknown_device";
+
+  try {
+    const userRef = db.collection("users").where("email", "==", userEmail);
+    const userSnap = await userRef.get();
+    let userData = null;
+    let pushToken = null;
+
+if (!userSnap.empty) {
+      userData = userSnap.docs[0].data();
+      // پش ٹوکن کو فائر بیس ڈاکومنٹ سے محفوظ طریقے سے حاصل کریں
+      pushToken = userData && userData.pushToken ? userData.pushToken : null; 
+      console.log("ℹ️ [DEBUG] Found Push Token for OTP verification:", pushToken);
+
+
+      if (userData.blockedUntil && Date.now() < userData.blockedUntil) {
+        return res.status(429).json({ 
+          success: false, 
+          message: "بار بار غلط کوششوں کی وجہ سے آپ کا اکاؤنٹ 24 گھنٹے کے لیے بلاک ہے۔" 
+        });
+      }
+    }
+
+    if (!otpStore[userEmail]) {
+      return res.status(400).json({ success: false, message: "کوڈ کی مدت ختم ہو چکی ہے، دوبارہ درخواست کریں۔" });
+    }
+
+    const session = otpStore[userEmail];
+
+    if (Date.now() > session.expiresAt) {
+      delete otpStore[userEmail];
+      return res.status(400).json({ success: false, message: "او ٹی پی کوڈ کی مدت ختم ہو چکی ہے" });
+    }
+
+    // 🔔 ڈیوائس تبدیل ہونے پر یوزر کے پرانے رجسٹرڈ ٹوکن پر پش نوٹیفکیشن بھیجیں
+    if (session.deviceId !== currentDevice) {
+      await sendAdminAlert("SUSPICIOUS LOGIN", `User ${userEmail} device mismatch. Attempting from ${currentDevice}.`);
+      
+      if (pushToken) {
+        await sendPushNotification(
+          pushToken,
+          "🚨 مشکوک لاگ ان کی کوشش!",
+          `کسی نے دوسری ڈیوائس (${currentDevice}) سے آپ کے اکاؤنٹ میں لاگ ان کرنے کی کوشش کی ہے۔`
+        );
+      }
+      return res.status(403).json({ success: false, message: "سیکیورٹی الرٹ: ڈیوائس تبدیل پائی گئی ہے۔" });
+    }
+
+    if (otpEnteredByUser.toString().trim() === session.otp.toString().trim()) {
+      delete otpStore[userEmail];
+      
+      if (!userSnap.empty) {
+        await userSnap.docs[0].ref.update({ blockedUntil: null });
+        
+        // 🔔 لاگ ان کامیاب ہونے پر پش نوٹیفکیشن بھیجیں
+        if (pushToken) {
+          await sendPushNotification(
+            pushToken,
+            "🔓 کامیاب لاگ ان!",
+            "آپ کا اکاؤنٹ کامیابی سے لاگ ان ہو گیا ہے۔"
+          );
+        }
+      }
+      return res.status(200).json({ success: true, message: "Verified!" });
+    } else {
+      session.attempts += 1;
+      
+      if (session.attempts >= 4) {
+        if (!userSnap.empty) {
+          const oneDay = 24 * 60 * 60 * 1000;
+          await userSnap.docs[0].ref.update({ blockedUntil: Date.now() + oneDay });
+        }
+        delete otpStore[userEmail];
+        await sendAdminAlert("BRUTE FORCE WARNING", `User ${userEmail} blocked for 24 hours.`);
+        
+        // 🔔 بار بار غلط کوشش پر یوزر کو الرٹ بھیجیں
+        if (pushToken) {
+          await sendPushNotification(
+            pushToken,
+            "⚠️ سیکیورٹی وارننگ: اکاؤنٹ بلاک!",
+            "غلط او ٹی پی کی کوششوں کی وجہ سے آپ کا اکاؤنٹ 24 گھنٹے کے لیے بلاک کر دیا گیا ہے۔"
+          );
+        }
+
+        return res.status(429).json({ success: false, message: "4 غلط کوششیں۔ اکاؤنٹ 24 گھنٹے کے لیے بلاک کر دیا گیا ہے۔" });
+      }
+
+      const remaining = 4 - session.attempts;
+      return res.status(400).json({ 
+        success: false, 
+        message: `غلط او ٹی پی کوڈ۔ باقی کوششیں: ${remaining}`,
+        remainingAttempts: remaining
+      });
+    }
+  } catch (error) {
+    console.error("Verification Error:", error);
+    return res.status(500).json({ success: false, message: "سرور ایرر" });
+  }
+});
+
+// 🛡️ Security Check Endpoint (Updated for Auto-Blocking)
+app.post('/api/check-security', async (req, res) => {
+  const { deviceId, email } = req.body;
+  if (!db) return res.status(500).json({ isAllowed: false, message: "DB Error" });
+  
+  try {
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const attemptRef = db.collection("signup_attempts").doc(deviceId);
+    const attemptSnap = await attemptRef.get();
+    
+    if (attemptSnap.exists && attemptSnap.data().isBanned) {
+      return res.status(403).json({ isAllowed: false, message: "سیکیورٹی الرٹ: اس ڈیوائس پر پابندی عائد ہے۔" });
+    }
+
+    const deviceSnapshot = await db.collection("users").where("deviceId", "==", deviceId).limit(1).get();
+    const emailSnapshot = await db.collection("users").where("email", "==", normalizedEmail).limit(1).get();
+
+   if (!deviceSnapshot.empty || !emailSnapshot.empty) {
+      const docSnapshot = !deviceSnapshot.empty ? deviceSnapshot.docs[0] : emailSnapshot.docs[0];
+      const existingAccount = docSnapshot.data();
+      const pushToken = existingAccount && existingAccount.pushToken ? existingAccount.pushToken : null; 
+      console.log("ℹ️ [DEBUG] Found Push Token for security alert:", pushToken);
+      
+      const currentCount = attemptSnap.exists ? (attemptSnap.data().count || 0) : 0;
+      const newCount = currentCount + 1;
+
+      await attemptRef.set({
+        count: newCount,
+        isBanned: newCount >= 3, 
+        lastAttempt: new Date().toISOString(),
+        attemptedEmail: normalizedEmail, 
+        existingAccountEmail: existingAccount.email, 
+        existingAccountName: existingAccount.name
+      }, { merge: true });
+
+      // 🔔 موبائل پر خودکار پش الرٹ بھیجیں کہ کسی نے نیا اکاؤنٹ بنانے کی کوشش کی ہے
+      if (pushToken) {
+        await sendPushNotification(
+          pushToken,
+          "🛡️ سیکیورٹی وارننگ!",
+          `آپ کی ڈیوائس سے ایک نئے اکاؤنٹ (${normalizedEmail}) کو رجسٹر کرنے کی کوشش کی گئی ہے۔`
+        );
+      }
+
+      if (newCount >= 3) {
+        return res.status(403).json({ 
+          isAllowed: false, 
+          message: "بار بار ملٹیپل اکاؤنٹ بنانے کی کوشش پر آپ کو مستقل بلاک کر دیا گیا ہے۔" 
+        });
+      }
+
+      return res.status(200).json({ 
+        isAllowed: false, 
+        message: `یہ ڈیوائس یا ای میل پہلے سے رجسٹرڈ ہے۔ کوششیں باقی: ${3 - newCount}` 
+      });
+    }
+
+    const bannedRef = await db.collection("banned_devices").doc(deviceId).get();
+    if (bannedRef.exists) return res.status(403).json({ isAllowed: false, message: "ڈیوائس بلاک ہے۔" });
+
+    return res.status(200).json({ isAllowed: true });
+  } catch (error) {
+    console.error("Security Check Error:", error);
+    return res.status(500).json({ isAllowed: false, message: "سرور ایرر" });
+  }
+});
+
+
+// 🔔 نیا آرڈر نوٹیفیکیشن بھیجنے کی API
+app.post('/api/send-order-notification', async (req, res) => {
+  const { userId, orderTitle, orderDetails } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ success: false, message: "User ID بھیجنا ضروری ہے۔" });
+  }
+
+  try {
+    if (!db) {
+      return res.status(500).json({ success: false, message: "ڈیٹا بیس کنکشن موجود نہیں ہے۔" });
+    }
+
+    // 1. فائر بیس کے 'users' کلیکشن سے اس کسٹمر کا ڈاکومنٹ نکالیں
+    const userDoc = await db.collection("users").doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, message: "یوزر ڈیٹا بیس میں نہیں ملا۔" });
+    }
+
+    const userData = userDoc.data();
+    const pushToken = userData.pushToken; // یوزر کا پش ٹوکن حاصل کریں
+
+    if (!pushToken) {
+      return res.status(400).json({ success: false, message: "اس یوزر کا کوئی پش ٹوکن (Push Token) رجسٹرڈ نہیں ہے۔" });
+    }
+
+    // 2. پش نوٹیفکیشن بھیجیں (اوپر بنے ہوئے sendPushNotification ہیلپر فنکشن کے ذریعے)
+    await sendPushNotification(
+      pushToken,
+      orderTitle || "آرڈر الرٹ! 🎉",
+      orderDetails || "آپ کا آرڈر کامیابی سے موصول ہو گیا ہے۔"
+    );
+
+    return res.status(200).json({ success: true, message: "نوٹیفیکیشن کامیابی سے بھیج دیا گیا!" });
+
+  } catch (error) {
+    console.error("❌ Notification Send Error:", error);
+    return res.status(500).json({ success: false, message: "نوٹیفیکیشن بھیجنے میں خرابی پیش آئی۔" });
+  }
+});
+
+app.post('/api/get-signature', (req, res) => {
+  const timestamp = Math.round(new Date().getTime() / 1000);
+  
+  // 1. مجاز پری سیٹس کی فہرست (Allowlist)
+  const allowedPresets = ["nasirify-preset", "secure-cnic-upload"];
+  
+  // 2. ریکویسٹ سے پری سیٹ لیں (ڈیفالٹ کے طور پر 'secure-cnic-upload' رکھیں)
+  const requestedPreset = req.body.upload_preset || "secure-cnic-upload";
+
+  // 3. سیکیورٹی چیک: اگر پری سیٹ ہماری فہرست میں نہیں ہے تو اسے مسترد کریں
+  if (!allowedPresets.includes(requestedPreset)) {
+    console.warn(`⚠️ Unauthorized signature attempt for preset: ${requestedPreset}`);
+    return res.status(403).json({ success: false, error: "Invalid or unauthorized upload preset." });
+  }
+
+  const params = {
+    timestamp: timestamp,
+    upload_preset: requestedPreset
+  };
+
+  try {
+    // 4. کلاؤڈ نری کے خفیہ سیکیریٹ کے ساتھ دستخط جنریٹ کریں
+    const signature = cloudinary.utils.api_sign_request(params, process.env.CLOUDINARY_API_SECRET);
+    
+    res.json({
+      signature: signature,
+      timestamp: timestamp,
+      api_key: process.env.CLOUDINARY_API_KEY
+    });
+  } catch (error) {
+    console.error("❌ Signature error:", error);
+    res.status(500).json({ success: false, error: "Failed to generate signature" });
+  }
+});
+
+const serverless = require('serverless-http');
+module.exports.handler = serverless(app);
