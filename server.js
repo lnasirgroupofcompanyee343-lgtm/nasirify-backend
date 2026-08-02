@@ -45,6 +45,9 @@ dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 
+// 🛠️ Netlify proxy ke liye trust proxy enable karein
+app.set('trust proxy', 1);
+
 // 🛡️ [SECURITY MIDDLEWARES]
 app.use(helmet()); // Basic security headers
 const limiter = rateLimit({
