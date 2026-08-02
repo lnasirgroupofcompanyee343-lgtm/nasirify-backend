@@ -17,14 +17,38 @@ cloudinary.config({
 });
 
 // Firebase initialization
+// Firebase initialization
 if (!admin.apps.length) {
   try {
     if (process.env.FIREBASE_PROJECT_ID) {
+      let rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY || '';
+      
+      // 1. Shuru aur aakhir ke quotes aur double escaping (\n) ko handle karein
+      let formattedPrivateKey = rawPrivateKey
+        .replace(/^["']|["']$/g, '')
+        .replace(/\\n/g, '\n');
+
+      // 2. Agar Netlify ki wajah se \n gayab ho gaye hon aur key ek hi line mein ho, toh usay theek karein
+      if (!formattedPrivateKey.includes('\n') && formattedPrivateKey.includes('-----BEGIN PRIVATE KEY-----')) {
+        formattedPrivateKey = formattedPrivateKey
+          .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
+          .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
+          
+        // Beech ke hissay ko 64 characters ke baad newline dein agar zaroorat ho
+        let base64Body = formattedPrivateKey
+          .replace('-----BEGIN PRIVATE KEY-----\n', '')
+          .replace('\n-----END PRIVATE KEY-----', '')
+          .replace(/\s+/g, '');
+          
+        let chunckedBody = base64Body.match(/.{1,64}/g).join('\n');
+        formattedPrivateKey = `-----BEGIN PRIVATE KEY-----\n${chunckedBody}\n-----END PRIVATE KEY-----`;
+      }
+
       admin.initializeApp({
         credential: admin.credential.cert({
           projectId: process.env.FIREBASE_PROJECT_ID,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined
+          privateKey: formattedPrivateKey
         })
       });
       console.log("✅ Firebase initialized with environment variables.");
@@ -44,6 +68,9 @@ const db = admin.apps.length ? admin.firestore() : null;
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
+
+// 🛠️ Netlify proxy ke liye trust proxy enable karein
+app.set('trust proxy', 1);
 
 // 🛡️ [SECURITY MIDDLEWARES]
 app.use(helmet()); // Basic security headers
