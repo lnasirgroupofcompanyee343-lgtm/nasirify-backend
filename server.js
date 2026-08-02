@@ -17,14 +17,29 @@ cloudinary.config({
 });
 
 // Firebase initialization
+// Firebase initialization
 if (!admin.apps.length) {
   try {
     if (process.env.FIREBASE_PROJECT_ID) {
+      let rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY || '';
+      
+      // Formatting ko theek karne ke liye advanced replacement
+      let formattedPrivateKey = rawPrivateKey
+        .replace(/^["']|["']$/g, '') // Agar shuru ya aakhir mein quotes hon toh hata dein
+        .replace(/\\n/g, '\n');     // Literal \n ko real newline mein badal dein
+
+      // Agar kisi wajah se key mein \n na ho balki spaces hon, ya standard format ho
+      if (!formattedPrivateKey.includes('\n') && formattedPrivateKey.includes('-----BEGIN PRIVATE KEY-----')) {
+        formattedPrivateKey = formattedPrivateKey
+          .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
+          .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
+      }
+
       admin.initializeApp({
         credential: admin.credential.cert({
           projectId: process.env.FIREBASE_PROJECT_ID,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined
+          privateKey: formattedPrivateKey
         })
       });
       console.log("✅ Firebase initialized with environment variables.");
@@ -44,6 +59,9 @@ const db = admin.apps.length ? admin.firestore() : null;
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
+
+// 🛠️ Netlify proxy ke liye trust proxy enable karein
+app.set('trust proxy', 1);
 
 // 🛡️ [SECURITY MIDDLEWARES]
 app.use(helmet()); // Basic security headers
