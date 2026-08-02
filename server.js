@@ -20,11 +20,14 @@ cloudinary.config({
 if (!admin.apps.length) {
   try {
     if (process.env.FIREBASE_PROJECT_ID) {
+      const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY || '';
+      const formattedPrivateKey = rawPrivateKey.replace(/\\n/g, '\n').replace(/"/g, '');
+
       admin.initializeApp({
         credential: admin.credential.cert({
           projectId: process.env.FIREBASE_PROJECT_ID,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined
+          privateKey: formattedPrivateKey
         })
       });
       console.log("✅ Firebase initialized with environment variables.");
@@ -44,6 +47,9 @@ const db = admin.apps.length ? admin.firestore() : null;
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
+
+// 🛠️ Netlify proxy ke liye trust proxy enable karein
+app.set('trust proxy', 1);
 
 // 🛡️ [SECURITY MIDDLEWARES]
 app.use(helmet()); // Basic security headers
